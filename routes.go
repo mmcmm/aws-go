@@ -1,14 +1,17 @@
 package main
 
 import (
-	"log"
 	"net/http"
 
+	log "github.com/Sirupsen/logrus"
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
 )
 
 func registerRoutes() *gin.Engine {
+
+	log.Info("Registering routes")
+
 	r := gin.Default()
 
 	store := sessions.NewCookieStore([]byte("viErkShjgQP59tgelRXsILXNEarwRA6p"))
@@ -55,16 +58,16 @@ func home(c *gin.Context) {
 	u := session.Get(userKey)
 
 	if u != nil {
-		log.Printf("user: %v\n", u)
-		user, err := findUserByID(u.(uint))
+		log.Info("user: %v", u)
+		user, err := findUserByID(u.(string))
 
 		if err != nil {
-			log.Println("Error getting user:", err.Error())
+			log.Error("Error getting user:", err.Error())
 			c.Redirect(302, "/signup")
 			return
 		}
 
-		log.Printf("Found session user: %v\n", user)
+		log.Info("Found session user: %v\n", user)
 		c.Redirect(302, "/photos")
 	} else {
 		c.Redirect(302, "/signup")

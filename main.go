@@ -1,9 +1,9 @@
 package main
 
 import (
-	"log"
 	"os"
 
+	log "github.com/Sirupsen/logrus"
 	"github.com/jinzhu/gorm"
 	_ "github.com/jinzhu/gorm/dialects/sqlite"
 )
@@ -31,6 +31,6 @@ func main() {
 		port = "5000"
 	}
 
-	log.Printf("Listening on port %s\n", port)
+	log.Info("Listening on :", port)
 	r.Run(":" + port)
 }

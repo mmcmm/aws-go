@@ -2,30 +2,28 @@ package main
 
 import (
 	"errors"
-	"log"
 	"net/http"
-	"strconv"
 
-	"golang.org/x/crypto/bcrypt"
-
+	log "github.com/Sirupsen/logrus"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
 )
 
 type user struct {
-	ID       uint
+	ID       string `sql:"type:varchar(36);primary key"` // Cognito UUID
 	Email    string
 	Username string
-	Password string
 	FullName string
 }
 
 type follower struct {
-	UserID     uint `gorm:"unique_index:idx_user_follower"`
-	FollowerID uint `gorm:"unique_index:idx_user_follower"`
+	UserID     string `gorm:"unique_index:idx_user_follower"`
+	FollowerID string `gorm:"unique_index:idx_user_follower"`
 }
 
 const userKey = "userid"
+const accessToken = "accessToken"
 
 func loginForm(c *gin.Context) {
 	session := sessions.Default(c)
@@ -38,7 +36,7 @@ func loginForm(c *gin.Context) {
 
 func login(c *gin.Context) {
 	username := c.PostForm("username")
-	password := []byte(c.PostForm("password"))
+	password := c.PostForm("password")
 	u := &user{}
 	session := sessions.Default(c)
 
@@ -55,19 +53,27 @@ func login(c *gin.Context) {
 			"user":  u,
 		})
 	} else {
-		if bcrypt.CompareHashAndPassword([]byte(u.Password), password) != nil {
-			session.AddFlash("Bad password")
+		log.Info("Authenticating via Cognito: ", username)
+		cog := NewCognito()
+		jwt, err := cog.SignIn(username, password)
+
+		if err != nil {
+			msg := err.(awserr.Error).Message()
+			log.Error("Signin Error: ", msg)
+			session.AddFlash(msg)
 			session.Save()
 			c.HTML(http.StatusOK, "login.html", gin.H{
 				"flash": session.Flashes(),
 				"user":  u,
 			})
 		} else {
-			log.Println("Saving user in session:", u.Username)
-			session.Set(userKey, u.ID)
+			log.Info("Authentication successful")
+			sub, _ := cog.ValidateToken(jwt)
+			session.Set(accessToken, jwt)
+			session.Set(userKey, sub)
 			session.Save()
-			u := session.Get(userKey)
-			log.Println("Testing user in session:", u)
+			t := session.Get(accessToken)
+			log.Info("Testing user in session:", t)
 			c.Redirect(http.StatusFound, "/photos")
 		}
 	}
@@ -81,15 +87,10 @@ func signupForm(c *gin.Context) {
 }
 
 func signup(c *gin.Context) {
-
-	password := []byte(c.PostForm("password"))
-	hashedPassword, _ := bcrypt.GenerateFromPassword(password, bcrypt.DefaultCost)
-
 	user := &user{
 		FullName: c.PostForm("fullName"),
 		Username: c.PostForm("username"),
 		Email:    c.PostForm("email"),
-		Password: string(hashedPassword),
 	}
 
 	session := sessions.Default(c)
@@ -107,18 +108,45 @@ func signup(c *gin.Context) {
 		return
 	}
 
-	log.Println("Creating DB user:", user.Username)
+	cog := NewCognito()
+	password := c.PostForm("password")
+	jwt, err := cog.SignUp(user.Username, password, user.Email, user.FullName)
+
+	if err != nil {
+		msg := err.(awserr.Error).Message()
+		log.Error("SignUp error: ", msg)
+		session.AddFlash(msg)
+		c.HTML(http.StatusOK, "signup.html", gin.H{
+			"flash": session.Flashes(),
+			"user":  user,
+		})
+		session.Save()
+		return
+	}
+
+	log.Info("Creating DB user:", user.Username)
+
+	sub, err := cog.ValidateToken(jwt)
+
+	if err != nil {
+		return
+	}
+
+	log.Info("Cognito 'sub': ", sub)
+
+	user.ID = sub // Set user ID to Cognito UUID
 
 	if err := db.Create(user); err.Error != nil {
-		log.Println("Error:", err.Error)
+		log.Error("Error:", err.Error)
 		session.AddFlash(err.Error)
 		c.HTML(http.StatusOK, "signup.html", gin.H{
 			"flash": session.Flashes(),
 			"user":  user,
 		})
 	} else {
-		log.Println("Saving user in session:", user.Username)
+		log.Info("Saving userid in session for: ", user.Username)
 		session.Set(userKey, user.ID)
+		session.Set(accessToken, jwt)
 		session.Save()
 		c.Redirect(http.StatusFound, "/photos")
 	}
@@ -140,7 +168,7 @@ func Profile(c *gin.Context) {
 	user := &user{Username: c.Params.ByName("username")}
 
 	if err := db.Where(&user).First(&user); err.Error != nil {
-		log.Println("Error:", err.Error)
+		log.Error("Error:", err.Error)
 		c.HTML(http.StatusOK, "404.html", nil)
 		return
 	}
@@ -148,14 +176,14 @@ func Profile(c *gin.Context) {
 	photos := []photo{}
 
 	if err := db.Where("user_id = ?", user.ID).Order("id desc").Find(&photos); err.Error != nil {
-		log.Println("Error:", err.Error)
+		log.Error("Error:", err.Error)
 		c.HTML(http.StatusOK, "404.html", nil)
 		return
 	}
 
 	session := sessions.Default(c)
 	uid := session.Get(userKey)
-	currentUser, _ := findUserByID(uid.(uint))
+	currentUser, _ := findUserByID(uid.(string))
 
 	c.HTML(http.StatusOK, "user.html", gin.H{
 		"user":        user,
@@ -175,14 +203,14 @@ func findUserByUsername(username string) (*user, error) {
 	return u, nil
 }
 
-func findUserByID(id uint) (*user, error) {
+func findUserByID(id string) (*user, error) {
 	u := &user{}
 
 	if err := db.Where("id = ?", id).First(&u); err.Error != nil {
 		return nil, err.Error
 	}
 
-	if u.ID == 0 {
+	if u.ID == "" {
 		return nil, errors.New("User not found")
 	}
 
@@ -195,7 +223,7 @@ func (u *user) PhotoCount() uint {
 	var count uint
 
 	if err := db.Where("user_id = ?", u.ID).Find(&photos).Count(&count); err.Error != nil {
-		log.Println("Error:", err.Error)
+		log.Error("Error:", err.Error)
 	}
 
 	return count
@@ -205,15 +233,15 @@ func (u *user) PhotoCount() uint {
 func Follow(c *gin.Context) {
 	session := sessions.Default(c)
 	uid := session.Get(userKey)
-	fid, _ := strconv.ParseUint(c.Params.ByName("id"), 10, 64)
+	fid := c.Params.ByName("id")
 
 	follower := &follower{
-		UserID:     uint(fid),
-		FollowerID: uid.(uint),
+		UserID:     fid,
+		FollowerID: uid.(string),
 	}
 
 	if err := db.Create(follower); err.Error != nil {
-		log.Println("Error:", err.Error)
+		log.Error("Error:", err.Error)
 	}
 
 	c.JSON(http.StatusOK, nil)
@@ -223,15 +251,15 @@ func Follow(c *gin.Context) {
 func Unfollow(c *gin.Context) {
 	session := sessions.Default(c)
 	uid := session.Get(userKey)
-	fid, _ := strconv.ParseUint(c.Params.ByName("id"), 10, 64)
+	fid := c.Params.ByName("id")
 
 	follower := &follower{
-		UserID:     uint(fid),
-		FollowerID: uid.(uint),
+		UserID:     fid,
+		FollowerID: uid.(string),
 	}
 
 	if err := db.Where(&follower).Delete(follower); err.Error != nil {
-		log.Println("Error:", err.Error)
+		log.Error("Error:", err.Error)
 	}
 
 	c.JSON(http.StatusOK, nil)
@@ -243,7 +271,7 @@ func (u *user) Followers() uint {
 	var count uint
 
 	if err := db.Where("user_id = ?", u.ID).Find(&followers).Count(&count); err.Error != nil {
-		log.Println("Error:", err.Error)
+		log.Error("Error:", err.Error)
 	}
 
 	return count
@@ -255,14 +283,14 @@ func (u *user) Following() uint {
 	var count uint
 
 	if err := db.Where("follower_id = ?", u.ID).Find(&followers).Count(&count); err.Error != nil {
-		log.Println("Error:", err.Error)
+		log.Error("Error:", err.Error)
 	}
 
 	return count
 }
 
 // Follows returns true if the user (u) follows the userid
-func (u *user) Follows(userid uint) bool {
+func (u *user) Follows(userid string) bool {
 
 	follower := &follower{
 		UserID:     userid,
@@ -270,7 +298,7 @@ func (u *user) Follows(userid uint) bool {
 	}
 
 	if err := db.Where(&follower).Find(&follower); err.Error != nil {
-		log.Println("Error:", err.Error)
+		log.Error("Error:", err.Error)
 	}
 
 	return true

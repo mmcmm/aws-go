@@ -8,7 +8,6 @@ import (
 	"image/gif"
 	"image/jpeg"
 	"image/png"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	log "github.com/Sirupsen/logrus"
 	humanize "github.com/dustin/go-humanize"
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
@@ -24,7 +24,7 @@ import (
 
 type photo struct {
 	ID        uint
-	UserID    uint
+	UserID    string `sql:"type:varchar(36);primary key"` // Cognito UUID
 	Filename  string
 	Caption   string
 	CreatedAt time.Time
@@ -43,16 +43,16 @@ func FetchAllPhotos(c *gin.Context) {
 		return
 	}
 
-	user, err := findUserByID(uid.(uint))
+	user, err := findUserByID(uid.(string))
 
 	if err != nil {
-		log.Println("Could not find user:", err)
+		log.Error("Could not find user:", err)
 	}
 
 	photos := []photo{}
 	db.Order("id desc").Find(&photos)
 
-	currentUser, _ := findUserByID(uid.(uint))
+	currentUser, _ := findUserByID(uid.(string))
 
 	c.HTML(http.StatusOK, "photos.html", gin.H{
 		"user":        user,
@@ -80,14 +80,14 @@ func FetchSinglePhoto(c *gin.Context) {
 	user, err := findUserByID(photo.UserID)
 
 	if err != nil {
-		log.Println("Could not find user:", err)
+		log.Error("Could not find user:", err)
 	}
 
 	// Load comments
 	comments := []comment{}
 	db.Where("photo_id = ?", id).Find(&comments)
 
-	currentUser, _ := findUserByID(uid.(uint))
+	currentUser, _ := findUserByID(uid.(string))
 
 	c.HTML(http.StatusOK, "photo.html", gin.H{
 		"user":        user,
@@ -102,10 +102,12 @@ func FetchSinglePhoto(c *gin.Context) {
 func CreatePhoto(c *gin.Context) {
 
 	session := sessions.Default(c)
-	uid := session.Get(userKey)
+	jwt := session.Get(accessToken)
+	cog := NewCognito()
+	sub, _ := cog.ValidateToken(jwt.(string))
 
 	if err != nil {
-		c.String(http.StatusBadRequest, fmt.Sprintf("Could not find user: %s", uid))
+		c.String(http.StatusBadRequest, fmt.Sprintf("Could not find user: %s", sub))
 		return
 	}
 
@@ -117,18 +119,18 @@ func CreatePhoto(c *gin.Context) {
 	}
 
 	infile := form.File["photofile"][0]
-	log.Println("Uploaded file:", infile.Filename)
+	log.Info("Uploaded file:", infile.Filename)
 
 	caption := form.Value["caption"][0]
-	log.Println("Caption:", caption)
+	log.Info("Caption:", caption)
 
-	uploadsdir := fmt.Sprintf("./public/uploads/%d", uid)
+	uploadsdir := fmt.Sprintf("./public/uploads/%s", sub)
 
 	if _, err := os.Stat(uploadsdir); os.IsNotExist(err) {
 		os.Mkdir(uploadsdir, os.ModePerm)
 	}
 
-	thumbnailsdir := fmt.Sprintf("./public/thumbnails/%d", uid)
+	thumbnailsdir := fmt.Sprintf("./public/thumbnails/%s", sub)
 
 	if _, err := os.Stat(thumbnailsdir); os.IsNotExist(err) {
 		os.Mkdir(thumbnailsdir, os.ModePerm)
@@ -147,11 +149,11 @@ func CreatePhoto(c *gin.Context) {
 		return
 	}
 
-	log.Println("Uploaded file:", outfile)
+	log.Info("Uploaded file:", outfile)
 
 	// Insert DB record for photo and user
 
-	photoid, err := insertPhoto(uid.(uint), fn, caption)
+	photoid, err := insertPhoto(sub, fn, caption)
 
 	if err != nil {
 		c.String(http.StatusBadRequest, fmt.Sprintf("Insert photo err: %s", err.Error()))
@@ -160,7 +162,7 @@ func CreatePhoto(c *gin.Context) {
 
 	// Generate thumbnail
 
-	err = generateThumbnail(uid.(uint), outfile, thumbnailSize)
+	err = generateThumbnail(outfile, thumbnailSize)
 
 	if err != nil {
 		c.String(http.StatusBadRequest, fmt.Sprintf("Error generating thumbnail: %s", err.Error()))
@@ -181,7 +183,7 @@ func DeletePhoto(c *gin.Context) {
 	var p photo
 
 	if err := db.Where("id = ?", id).Delete(&p).Error; err != nil {
-		log.Println("Error deleting photo:", err)
+		log.Error("Error deleting photo:", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err})
 		return
 	}
@@ -198,7 +200,7 @@ func LikePhoto(c *gin.Context) {
 	photo.Likes++
 
 	if err := db.Save(photo); err.Error != nil {
-		log.Println("Error updating photo:", err.Error)
+		log.Error("Error updating photo:", err.Error)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"likes": photo.Likes})
@@ -214,26 +216,26 @@ func CommentPhoto(c *gin.Context) {
 	}
 
 	if err := c.BindJSON(&comment); err != nil {
-		log.Println("BindJSON error:", err.Error())
+		log.Error("BindJSON error:", err.Error())
 	}
 
 	log.Printf("Comment: %v\n", comment.Comment)
 
 	session := sessions.Default(c)
 	uid := session.Get(userKey)
-	id, err := InsertComment(uint(photoid), uid.(uint), comment.Comment)
+	id, err := InsertComment(uint(photoid), uid.(string), comment.Comment)
 
 	if err != nil {
-		log.Println("Error inserting comment:", err.Error())
+		log.Error("Error inserting comment:", err.Error())
 	}
 
-	user, _ := findUserByID(uid.(uint))
+	user, _ := findUserByID(uid.(string))
 
 	c.JSON(http.StatusOK, gin.H{"id": id, "username": user.Username})
 }
 
 // Insert photo record into database
-func insertPhoto(uid uint, fn string, caption string) (uint, error) {
+func insertPhoto(uid string, fn string, caption string) (uint, error) {
 
 	photo := &photo{
 		UserID:    uid,
@@ -246,27 +248,27 @@ func insertPhoto(uid uint, fn string, caption string) (uint, error) {
 		return 0, err.Error
 	}
 
-	log.Println("Inserted photo record:", photo.ID)
+	log.Info("Inserted photo record:", photo.ID)
 
 	return photo.ID, nil
 }
 
-func generateThumbnail(uid uint, photopath string, maxWidth uint) error {
+func generateThumbnail(photopath string, maxWidth uint) error {
 
-	log.Println("Generating thumbnail for:", photopath)
+	log.Info("Generating thumbnail for:", photopath)
 
 	_, format, err := decodeConfig(photopath)
 
 	if err != nil {
-		log.Println(err)
+		log.Error(err)
 		return err
 	}
 
-	log.Println("Image format:", format)
+	log.Info("Image format:", format)
 
 	file, err := os.Open(photopath)
 	if err != nil {
-		log.Println("Error opening photo:", err)
+		log.Error("Error opening photo:", err)
 	}
 
 	var img image.Image
@@ -283,7 +285,7 @@ func generateThumbnail(uid uint, photopath string, maxWidth uint) error {
 	}
 
 	if err != nil {
-		log.Println("Error decoding photo:", err)
+		log.Error("Error decoding photo:", err)
 	}
 	file.Close()
 
@@ -295,7 +297,7 @@ func generateThumbnail(uid uint, photopath string, maxWidth uint) error {
 	out, err := os.Create(thumbnailPath)
 
 	if err != nil {
-		log.Println("Error creating thumbnail path:", err)
+		log.Error("Error creating thumbnail path:", err)
 	}
 
 	defer out.Close()
@@ -312,7 +314,7 @@ func generateThumbnail(uid uint, photopath string, maxWidth uint) error {
 	}
 
 	if err != nil {
-		log.Println("Error encoding thumbnail:", err)
+		log.Error("Error encoding thumbnail:", err)
 		return err
 	}
 
