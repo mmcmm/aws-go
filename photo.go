@@ -1,18 +1,13 @@
 package main
 
 import (
-	"bufio"
-	"errors"
+	"bytes"
 	"fmt"
-	"image"
-	"image/gif"
 	"image/jpeg"
-	"image/png"
+	"mime"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
@@ -20,6 +15,12 @@ import (
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
 	"github.com/nfnt/resize"
+	"github.com/spf13/viper"
+
+	"github.com/aws/aws-sdk-go/aws"
+	awsSession "github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 )
 
 type photo struct {
@@ -32,6 +33,26 @@ type photo struct {
 }
 
 const thumbnailSize uint = 600
+
+var bucketName string
+
+func init() {
+
+	log.Info("Initializing S3")
+
+	log.Info("Loading configuration")
+	viper.SetConfigName("config") // config.toml
+	viper.AddConfigPath(".")      // use working directory
+
+	if err := viper.ReadInConfig(); err != nil {
+		log.Errorf("error reading config file, %v", err)
+		return
+	}
+
+	bucketName = viper.GetString("s3.bucketName")
+
+	log.Info("S3 bucket: ", bucketName)
+}
 
 // FetchAllPhotos gets all photos for all users
 func FetchAllPhotos(c *gin.Context) {
@@ -118,42 +139,43 @@ func CreatePhoto(c *gin.Context) {
 		return
 	}
 
-	infile := form.File["photofile"][0]
-	log.Info("Uploaded file:", infile.Filename)
+	file, header, err := c.Request.FormFile("photofile")
+
+	if err != nil {
+		log.Errorf("Error uploading file %v", err)
+		return
+	}
+
+	defer file.Close()
 
 	caption := form.Value["caption"][0]
 	log.Info("Caption:", caption)
 
-	uploadsdir := fmt.Sprintf("./public/uploads/%s", sub)
+	// Upload file to S3 bucket
 
-	if _, err := os.Stat(uploadsdir); os.IsNotExist(err) {
-		os.Mkdir(uploadsdir, os.ModePerm)
-	}
+	sess := awsSession.Must(awsSession.NewSession())
+	uploader := s3manager.NewUploader(sess)
 
-	thumbnailsdir := fmt.Sprintf("./public/thumbnails/%s", sub)
+	key := sub + "/" + header.Filename
 
-	if _, err := os.Stat(thumbnailsdir); os.IsNotExist(err) {
-		os.Mkdir(thumbnailsdir, os.ModePerm)
-	}
+	_, err = uploader.Upload(&s3manager.UploadInput{
+		Bucket:      aws.String(bucketName),
+		Key:         aws.String(key),
+		Body:        file,
+		ContentType: aws.String(mime.TypeByExtension(filepath.Ext(header.Filename))),
+	})
 
-	// Generate unique filename
-
-	ts := strconv.FormatInt(time.Now().UnixNano(), 10)
-	fn := ts + filepath.Ext(infile.Filename)
-	outfile := filepath.Join(uploadsdir, fn)
-
-	// Save photo
-
-	if err := c.SaveUploadedFile(infile, outfile); err != nil {
-		c.String(http.StatusBadRequest, fmt.Sprintf("upload file err: %s", err.Error()))
+	if err != nil {
+		log.Errorf("Unable to upload file %q, %v", header.Filename, err)
+		c.String(http.StatusBadRequest, fmt.Sprintf("Upload file err: %s", err.Error()))
 		return
 	}
 
-	log.Info("Uploaded file:", outfile)
+	log.Info("Uploaded file:", header.Filename)
 
 	// Insert DB record for photo and user
 
-	photoid, err := insertPhoto(sub, fn, caption)
+	photoid, err := insertPhoto(sub, header.Filename, caption)
 
 	if err != nil {
 		c.String(http.StatusBadRequest, fmt.Sprintf("Insert photo err: %s", err.Error()))
@@ -162,7 +184,7 @@ func CreatePhoto(c *gin.Context) {
 
 	// Generate thumbnail
 
-	err = generateThumbnail(outfile, thumbnailSize)
+	err = generateThumbnail(sess, sub, header.Filename, key, thumbnailSize)
 
 	if err != nil {
 		c.String(http.StatusBadRequest, fmt.Sprintf("Error generating thumbnail: %s", err.Error()))
@@ -253,82 +275,63 @@ func insertPhoto(uid string, fn string, caption string) (uint, error) {
 	return photo.ID, nil
 }
 
-func generateThumbnail(photopath string, maxWidth uint) error {
+func generateThumbnail(sess *awsSession.Session, sub string, filename string, key string, maxWidth uint) error {
 
-	log.Info("Generating thumbnail for:", photopath)
+	log.Infof("Fetching s3://%v/%v", bucketName, key)
 
-	_, format, err := decodeConfig(photopath)
+	buff := &aws.WriteAtBuffer{}
+	s3dl := s3manager.NewDownloader(sess)
+	_, err := s3dl.Download(buff, &s3.GetObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(key),
+	})
 
 	if err != nil {
-		log.Error(err)
+		log.Fatalf("Could not download from S3: %v", err)
+	}
+
+	log.Infof("Decoding image")
+
+	imageBytes := buff.Bytes()
+	reader := bytes.NewReader(imageBytes)
+
+	img, err := jpeg.Decode(reader)
+	if err != nil {
+		log.Fatalf("bad response: %s", err)
+	}
+
+	log.Infof("Generating thumbnail")
+	thumbnail := resize.Thumbnail(maxWidth, maxWidth, img, resize.Lanczos3)
+
+	log.Infof("Encoding image for upload to S3")
+	buf := new(bytes.Buffer)
+	err = jpeg.Encode(buf, thumbnail, nil)
+
+	if err != nil {
+		log.Errorf("JPEG encoding error: %v", err)
 		return err
 	}
 
-	log.Info("Image format:", format)
+	thumbkey := sub + "/thumb/" + filename
 
-	file, err := os.Open(photopath)
-	if err != nil {
-		log.Error("Error opening photo:", err)
-	}
+	log.Infof("Preparing S3 object: %s", thumbkey)
 
-	var img image.Image
-
-	switch format {
-	case "jpeg":
-		img, err = jpeg.Decode(file)
-	case "png":
-		img, err = png.Decode(file)
-	case "gif":
-		img, err = gif.Decode(file)
-	default:
-		err = errors.New("Unsupported file type")
-	}
+	uploader := s3manager.NewUploader(sess)
+	result, err := uploader.Upload(&s3manager.UploadInput{
+		Body:        bytes.NewReader(buf.Bytes()),
+		Bucket:      aws.String(bucketName),
+		Key:         aws.String(thumbkey),
+		ContentType: aws.String(mime.TypeByExtension(filepath.Ext(filename))),
+	})
 
 	if err != nil {
-		log.Error("Error decoding photo:", err)
-	}
-	file.Close()
-
-	log.Printf("Resizing image to %dpx\n", maxWidth)
-	thumb := resize.Resize(maxWidth, 0, img, resize.Lanczos3)
-
-	thumbnailPath := strings.Replace(photopath, "uploads", "thumbnails", -1)
-
-	out, err := os.Create(thumbnailPath)
-
-	if err != nil {
-		log.Error("Error creating thumbnail path:", err)
-	}
-
-	defer out.Close()
-
-	switch format {
-	case "jpeg":
-		err = jpeg.Encode(out, thumb, nil)
-	case "png":
-		err = png.Encode(out, thumb)
-	case "gif":
-		err = gif.Encode(out, thumb, nil)
-	default:
-		err = errors.New("Unsupported file type")
-	}
-
-	if err != nil {
-		log.Error("Error encoding thumbnail:", err)
+		log.Error("Failed to upload", err)
 		return err
 	}
+
+	log.Println("Successfully uploaded to", result.Location)
 
 	return nil
-}
-
-// Detect image file format (i.e. jpeg, png, gif)
-func decodeConfig(filename string) (image.Config, string, error) {
-	f, err := os.Open(filename)
-	if err != nil {
-		return image.Config{}, "", err
-	}
-	defer f.Close()
-	return image.DecodeConfig(bufio.NewReader(f))
 }
 
 func (p *photo) TimeAgo() string {
