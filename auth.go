@@ -13,7 +13,7 @@ import (
 func AuthRequired() gin.HandlerFunc {
 	return func(c *gin.Context) {
 
-		log.Info("AuthRequired()")
+		log.Debug("AuthRequired()")
 
 		s := sessions.Default(c)
 		jwt := s.Get(accessToken)

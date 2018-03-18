@@ -152,8 +152,8 @@ func (c *Cognito) SignUp(username string, password string, email string, fullNam
 	idToken := aws.StringValue(chalresp.AuthenticationResult.IdToken)
 	accessToken := aws.StringValue(chalresp.AuthenticationResult.AccessToken)
 
-	log.Info("ID Token: ", idToken)
-	log.Info("AccessToken: ", accessToken)
+	log.Debug("ID Token: ", idToken)
+	log.Debug("AccessToken: ", accessToken)
 
 	return accessToken, nil
 }
@@ -181,7 +181,7 @@ func (c *Cognito) SignIn(username string, password string) (string, error) {
 
 	accessToken := aws.StringValue(authresp.AuthenticationResult.AccessToken)
 
-	log.Info("AccessToken: ", accessToken)
+	log.Debug("AccessToken: ", accessToken)
 
 	return accessToken, nil
 }
@@ -189,7 +189,7 @@ func (c *Cognito) SignIn(username string, password string) (string, error) {
 // ValidateToken validates a JWT token and returns the 'sub' claim.
 func (c *Cognito) ValidateToken(jwtToken string) (string, error) {
 
-	log.Info("ValidateToken: ", jwtToken)
+	log.Debug("ValidateToken: ", jwtToken)
 
 	token, err := jwt.Parse(jwtToken, c.getKey)
 	if err != nil {

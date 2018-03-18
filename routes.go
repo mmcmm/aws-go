@@ -44,7 +44,6 @@ func registerRoutes() *gin.Engine {
 		photos.POST("/", CreatePhoto)
 		photos.GET("/", FetchAllPhotos)
 		photos.GET("/:id", FetchSinglePhoto)
-		photos.PUT("/:id", UpdatePhoto)
 		photos.DELETE("/:id", DeletePhoto)
 		photos.POST("/:id/like", LikePhoto)
 		photos.POST("/:id/comment", CommentPhoto)
@@ -58,7 +57,7 @@ func home(c *gin.Context) {
 	u := session.Get(userKey)
 
 	if u != nil {
-		log.Info("user: %v", u)
+		log.Debugf("user: %v", u)
 		user, err := findUserByID(u.(string))
 
 		if err != nil {
@@ -67,7 +66,7 @@ func home(c *gin.Context) {
 			return
 		}
 
-		log.Info("Found session user: %v\n", user)
+		log.Debugf("Found session user: %v", user)
 		c.Redirect(302, "/photos")
 	} else {
 		c.Redirect(302, "/signup")
