@@ -5,3 +5,6 @@ jwksURL = "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_9ZCrt7dfk/.well
 
 [s3]
 bucketName = "photos"
+
+[sns]
+topicArn = "arn:aws:sns:us-east-1:746425690931:PhotosAppNewSubscriber"
